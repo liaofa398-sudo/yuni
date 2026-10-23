@@ -1,0 +1,6 @@
+{
+  "name": "予你 - 温柔的中文 AI 陪伴与礼物",
+  "description": "为特别的人打造的温柔、细腻、有记忆的中文 AI 陪伴空间。接入 DeepSeek 官方模型，支持个性化人设、长期记忆与专属礼物寄语，完全适配手机浏览。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

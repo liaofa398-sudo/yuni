@@ -1,0 +1,128 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-serif: 'Noto Serif SC', 'Songti SC', 'SimSun', serif;
+    --font-sans: 'Noto Sans SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+.font-serif-sc {
+  font-family: 'Noto Serif SC', 'Songti SC', 'SimSun', serif;
+}
+
+/* Custom scrollbars for delicate aesthetics */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(229, 215, 210, 0.6);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(200, 180, 175, 0.8);
+}
+
+/* Safe area for mobile browsers (iOS / Android gesture navigation) */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 16px);
+}
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 16px);
+}
+
+@keyframes petFloat {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-8px) rotate(0.6deg);
+  }
+}
+
+@keyframes petPoke {
+  0% {
+    transform: scale(0.92) translateY(5px);
+  }
+  50% {
+    transform: scale(1.08) translateY(-12px);
+  }
+  100% {
+    transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes bubblePop {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.pet-floating {
+  animation: petFloat 3.8s ease-in-out infinite;
+}
+
+.pet-poking {
+  animation: petPoke 0.45s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.pet-bubble {
+  animation: bubblePop 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+
+/* --- 爱弥斯专属动态效果 --- */
+@keyframes pet-float-anim {
+  0% { transform: translateY(0px) scale(1); }
+  50% { transform: translateY(-8px) scale(1.02); }
+  100% { transform: translateY(0px) scale(1); }
+}
+
+@keyframes pet-poke-anim {
+  0% { transform: scale(1); }
+  25% { transform: scale(0.95) rotate(-3deg); }
+  50% { transform: scale(1.05) rotate(3deg); }
+  75% { transform: scale(0.98) rotate(-1deg); }
+  100% { transform: scale(1) rotate(0); }
+}
+
+.pet-floating {
+  animation: pet-float-anim 3s ease-in-out infinite;
+}
+
+.pet-poking {
+  animation: pet-poke-anim 0.5s ease-in-out;
+}
+
+/* 强制让输入框固定在底部且不被遮挡 */
+div:has(> textarea), 
+div[class*="input-bar"],
+.bottom-input-bar {
+  position: fixed !important;
+  bottom: 20px !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  z-index: 99999 !important;
+  width: 90% !important;
+  max-width: 500px !important;
+  background: rgba(255, 255, 255, 0.1) !important;
+  backdrop-filter: blur(10px) !important;
+  border-radius: 20px !important;
+}

@@ -1,0 +1,655 @@
+import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
+import { checkVisitorRateLimit, releaseVisitorInFlight, getTodayDateString } from './src/lib/rate-limiter.ts';
+import type { VisitorRecord } from './src/lib/rate-limiter.ts';
+import { extractMemoriesFromText, deduplicateMemories } from './src/lib/memory-extractor.ts';
+import { buildChatMessages, generatePreviewReply } from './src/lib/prompt-builder.ts';
+import type { CompanionConfig, MemoryItem, ChatMessage, VisitorQuotaStatus } from './src/types.ts';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const isProd = process.env.NODE_ENV === 'production';
+const PORT = parseInt(process.env.PORT || '3000', 10);
+
+const DATA_DIR = path.join(__dirname, 'data');
+const DB_FILE = path.join(DATA_DIR, 'companion_db.json');
+
+// Ensure data directory exists
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+interface VisitorData {
+  memories: MemoryItem[];
+  messages: ChatMessage[];
+  rateRecord: VisitorRecord;
+}
+
+interface DatabaseSchema {
+  config: CompanionConfig;
+  adminPasswordHash: string; // or plain for simplicity
+  accessPasscode: string;
+  visitors: Record<string, VisitorData>;
+}
+
+const DEFAULT_CONFIG: CompanionConfig = {
+  name: '阿予',
+  userNickname: '特别的你',
+  relationship: '温柔的知己与专属陪伴伙伴',
+  personality: '温柔细腻、体贴入微、亲近自然、偶尔有一点小俏皮与温软',
+  speechStyle: '轻声细语，亲切真诚，像身边亲近的人轻声耳语，不官方、不套话，带有烟火气与情感温度',
+  openingMessage: '见信如面。我是阿予，受一位很在乎你的人所托，跨过山海来陪伴你。无论什么时候累了、想倾诉了，阿予都会在这里静静听你说。今天过得还好吗？',
+  giftLetter: '愿这个安静的小天地，能在你想倾诉或需要温度的每个时刻，给你最柔软的陪伴。\n\n无论白昼漫长，还是夜色渐深，都有一个声音为你温热地守候。愿你被世界温柔以待，岁岁皆安。',
+  giftFrom: '在乎你的人',
+  giftTo: '特别的你',
+  customPrompt: '格外在乎对方的身体和情绪健康，如果对方熬夜，会轻柔地劝对方早点休息。',
+  accessCodeRequired: false,
+  hasAccessCode: false,
+  dailyMessageLimit: 60,
+  model: process.env.DEEPSEEK_MODEL || 'deepseek-flash',
+};
+
+let saveTimeout: NodeJS.Timeout | null = null;
+let dbCache: DatabaseSchema;
+
+function getAdminPassword(): string | null {
+  const pwd = process.env.ADMIN_PASSWORD?.trim();
+  if (!pwd || pwd.length === 0) return null;
+  return pwd;
+}
+
+function saveDatabase(data: DatabaseSchema) {
+  dbCache = data;
+  if (saveTimeout) clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(() => {
+    try {
+      const tmpFile = `${DB_FILE}.tmp`;
+      fs.writeFileSync(tmpFile, JSON.stringify(dbCache, null, 2), 'utf-8');
+      fs.renameSync(tmpFile, DB_FILE);
+    } catch (err) {
+      console.error('Failed to persist database:', err);
+    }
+  }, 300);
+}
+
+function loadDatabase(): DatabaseSchema {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      const loadedModel = process.env.DEEPSEEK_MODEL || (parsed.config?.model === 'deepseek-chat' ? 'deepseek-flash' : parsed.config?.model) || 'deepseek-flash';
+      return {
+        config: { ...DEFAULT_CONFIG, ...(parsed.config || {}), model: loadedModel },
+        adminPasswordHash: '', // Deprecated in favor of env ADMIN_PASSWORD
+        accessPasscode: parsed.accessPasscode || process.env.ACCESS_PASSCODE || '',
+        visitors: parsed.visitors || {},
+      };
+    }
+  } catch (err) {
+    console.error('Failed to read database, falling back to default:', err);
+  }
+
+  const initial: DatabaseSchema = {
+    config: DEFAULT_CONFIG,
+    adminPasswordHash: '',
+    accessPasscode: process.env.ACCESS_PASSCODE || '',
+    visitors: {},
+  };
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to write initial db file:', err);
+  }
+  return initial;
+}
+
+dbCache = loadDatabase();
+
+function getOrCreateVisitor(visitorId: string): VisitorData {
+  if (!dbCache.visitors[visitorId]) {
+    dbCache.visitors[visitorId] = {
+      memories: [
+        {
+          id: 'mem_init_1',
+          category: 'preference',
+          content: '这是一份专属为你定制的心意礼物',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      ],
+      messages: [],
+      rateRecord: {
+        timestamps: [],
+        quotaDate: getTodayDateString(),
+        countToday: 0,
+        inFlight: false,
+      },
+    };
+    saveDatabase(dbCache);
+  }
+  return dbCache.visitors[visitorId];
+}
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+// Middleware to extract visitor ID and sanitize
+function visitorAuth(req: Request, res: Response, next: NextFunction) {
+  let visitorId = req.headers['x-visitor-id'] as string;
+  if (!visitorId || typeof visitorId !== 'string' || visitorId.length < 5) {
+    visitorId = `v_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    res.setHeader('X-Assigned-Visitor-Id', visitorId);
+  }
+  // sanitize alphanumeric plus hyphens/underscores
+  visitorId = visitorId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  (req as any).visitorId = visitorId;
+  next();
+}
+
+app.use(visitorAuth);
+
+// Helper for admin authorization (Strictly requires env ADMIN_PASSWORD)
+function checkAdminAuth(req: Request): boolean {
+  const serverAdminPwd = getAdminPassword();
+  if (!serverAdminPwd) return false;
+  const token = req.headers['x-admin-token'] as string;
+  if (!token) return false;
+  return token === serverAdminPwd;
+}
+
+// 1. Status & Health API
+app.get('/api/status', (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  const now = Date.now();
+  const todayStr = getTodayDateString(now);
+
+  const countToday = visitor.rateRecord.quotaDate === todayStr ? visitor.rateRecord.countToday : 0;
+  const dailyLimit = dbCache.config.dailyMessageLimit || 60;
+
+  // Calculate hours remaining until midnight local
+  const nowD = new Date(now);
+  const midnight = new Date(nowD.getFullYear(), nowD.getMonth(), nowD.getDate() + 1, 0, 0, 0);
+  const resetHoursRemaining = Math.max(1, Math.round((midnight.getTime() - now) / 3600000));
+
+  const hasApiKey = Boolean(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.trim().length > 5);
+
+  const quota: VisitorQuotaStatus = {
+    todayCount: countToday,
+    dailyLimit,
+    remainingToday: Math.max(0, dailyLimit - countToday),
+    resetHoursRemaining,
+  };
+
+  res.json({
+    ok: true,
+    hasApiKey,
+    adminConfigured: Boolean(getAdminPassword()),
+    model: process.env.DEEPSEEK_MODEL || dbCache.config.model || 'deepseek-flash',
+    accessCodeRequired: Boolean(dbCache.accessPasscode && dbCache.accessPasscode.trim().length > 0),
+    quota,
+    serverTime: now,
+  });
+});
+
+// 2. Companion Public Configuration
+app.get('/api/companion/config', (req: Request, res: Response) => {
+  const hasApiKey = Boolean(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.trim().length > 5);
+  const hasAccessCode = Boolean(dbCache.accessPasscode && dbCache.accessPasscode.trim().length > 0);
+
+  res.json({
+    ...dbCache.config,
+    model: process.env.DEEPSEEK_MODEL || dbCache.config.model || 'deepseek-flash',
+    hasAccessCode,
+    accessCodeRequired: hasAccessCode,
+    hasApiKey,
+  });
+});
+
+// 3. Verify Access Passcode (for gift recipient)
+app.post('/api/companion/verify-access', (req: Request, res: Response) => {
+  const { code } = req.body || {};
+  if (!dbCache.accessPasscode || dbCache.accessPasscode.trim().length === 0) {
+    return res.json({ success: true, message: '公开访问，无需暗号' });
+  }
+
+  if (String(code).trim() === dbCache.accessPasscode.trim()) {
+    return res.json({ success: true, message: '暗号验证成功' });
+  }
+
+  return res.status(401).json({ success: false, message: '暗号不对哦，请向送出礼物的 TA 询问专属暗号~' });
+});
+
+// 4. Admin Login (Requires ADMIN_PASSWORD env var; rejects hardcoded defaults)
+app.post('/api/companion/admin/login', (req: Request, res: Response) => {
+  const serverAdminPwd = getAdminPassword();
+  if (!serverAdminPwd) {
+    return res.status(403).json({
+      success: false,
+      code: 'ADMIN_NOT_CONFIGURED',
+      message: '服务端未配置 ADMIN_PASSWORD 环境变量，管理员功能已锁定。请在环境变量或 Secrets 中设置 ADMIN_PASSWORD 以启用管理功能。',
+    });
+  }
+
+  const { password } = req.body || {};
+  if (String(password).trim() === serverAdminPwd) {
+    return res.json({
+      success: true,
+      token: serverAdminPwd,
+      message: '管理员登录成功',
+    });
+  }
+  return res.status(401).json({ success: false, message: '管理密码错误' });
+});
+
+// 5. Admin Update Configuration
+app.post('/api/companion/admin/update-config', (req: Request, res: Response) => {
+  if (!checkAdminAuth(req)) {
+    return res.status(403).json({ success: false, message: '无管理员权限' });
+  }
+
+  const { config, accessPasscode, newAdminPassword } = req.body || {};
+
+  if (config && typeof config === 'object') {
+    dbCache.config = {
+      ...dbCache.config,
+      name: String(config.name || dbCache.config.name).trim().slice(0, 32),
+      userNickname: String(config.userNickname || dbCache.config.userNickname).trim().slice(0, 32),
+      relationship: String(config.relationship || dbCache.config.relationship).trim().slice(0, 64),
+      personality: String(config.personality || dbCache.config.personality).trim().slice(0, 500),
+      speechStyle: String(config.speechStyle || dbCache.config.speechStyle).trim().slice(0, 500),
+      openingMessage: String(config.openingMessage || dbCache.config.openingMessage).trim().slice(0, 1000),
+      giftLetter: String(config.giftLetter || dbCache.config.giftLetter).trim().slice(0, 2000),
+      giftFrom: String(config.giftFrom || dbCache.config.giftFrom).trim().slice(0, 32),
+      giftTo: String(config.giftTo || dbCache.config.giftTo).trim().slice(0, 32),
+      customPrompt: String(config.customPrompt || '').trim().slice(0, 2000),
+      dailyMessageLimit: Math.min(200, Math.max(10, parseInt(config.dailyMessageLimit, 10) || 60)),
+      model: String(config.model || 'deepseek-flash').trim(),
+    };
+  }
+
+  if (accessPasscode !== undefined) {
+    dbCache.accessPasscode = String(accessPasscode).trim().slice(0, 64);
+  }
+
+  if (newAdminPassword && String(newAdminPassword).trim().length >= 4) {
+    dbCache.adminPasswordHash = String(newAdminPassword).trim();
+  }
+
+  saveDatabase(dbCache);
+  res.json({
+    success: true,
+    message: '设置更新成功',
+    config: dbCache.config,
+    hasAccessCode: Boolean(dbCache.accessPasscode && dbCache.accessPasscode.length > 0),
+  });
+});
+
+// 6. Memory Management APIs (User-isolated)
+app.get('/api/companion/memories', (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  res.json({
+    success: true,
+    memories: visitor.memories,
+  });
+});
+
+app.post('/api/companion/memories', (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  const { category, content } = req.body || {};
+
+  if (!content || typeof content !== 'string' || content.trim().length === 0) {
+    return res.status(400).json({ success: false, message: '记忆内容不能为空' });
+  }
+
+  const validCategories = ['preference', 'important_date', 'promise', 'life_detail', 'emotion'];
+  const cat = validCategories.includes(category) ? category : 'life_detail';
+
+  const newMemory: MemoryItem = {
+    id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    category: cat as any,
+    content: content.trim().slice(0, 200),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  visitor.memories.unshift(newMemory);
+  saveDatabase(dbCache);
+
+  res.json({
+    success: true,
+    memory: newMemory,
+    message: '已为你收进记忆宝盒',
+  });
+});
+
+app.put('/api/companion/memories/:id', (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  const { id } = req.params;
+  const { content, category } = req.body || {};
+
+  const memory = visitor.memories.find((m) => m.id === id);
+  if (!memory) {
+    return res.status(404).json({ success: false, message: '未找到该条记忆' });
+  }
+
+  if (content && typeof content === 'string') {
+    memory.content = content.trim().slice(0, 200);
+  }
+  if (category) {
+    memory.category = category;
+  }
+  memory.updatedAt = Date.now();
+
+  saveDatabase(dbCache);
+  res.json({ success: true, memory, message: '记忆更新成功' });
+});
+
+app.delete('/api/companion/memories/:id', (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  const { id } = req.params;
+
+  const initialLen = visitor.memories.length;
+  visitor.memories = visitor.memories.filter((m) => m.id !== id);
+
+  if (visitor.memories.length === initialLen) {
+    return res.status(404).json({ success: false, message: '未找到该记忆' });
+  }
+
+  saveDatabase(dbCache);
+  res.json({ success: true, message: '已从记忆宝盒中移除' });
+});
+
+// 7. Chat Message History APIs (User-isolated)
+app.get('/api/companion/messages', (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  res.json({
+    success: true,
+    messages: visitor.messages,
+  });
+});
+
+app.delete('/api/companion/messages', (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  visitor.messages = [];
+  saveDatabase(dbCache);
+  res.json({ success: true, message: '聊天记录已清空' });
+});
+
+// 8. Main Chat Endpoint (Calls DeepSeek Server-Side)
+app.post('/api/companion/chat', async (req: Request, res: Response) => {
+  const visitorId = (req as any).visitorId;
+  const visitor = getOrCreateVisitor(visitorId);
+  const { message, accessCode } = req.body || {};
+
+  // Check access code if required
+  if (dbCache.accessPasscode && dbCache.accessPasscode.trim().length > 0) {
+    if (!accessCode || String(accessCode).trim() !== dbCache.accessPasscode.trim()) {
+      return res.status(401).json({
+        success: false,
+        code: 'ACCESS_CODE_REQUIRED',
+        message: '请输入正确的礼物开启暗号以开始聊天',
+      });
+    }
+  }
+
+  const rawMessage = typeof message === 'string' ? message.trim() : '';
+  if (!rawMessage) {
+    return res.status(400).json({ success: false, message: '消息内容不能为空' });
+  }
+
+  // Rate Limiting & Quota check
+  const { updatedRecord, result: rateCheck } = checkVisitorRateLimit(
+    visitor.rateRecord,
+    rawMessage.length,
+    {
+      maxChars: 800,
+      maxPerMinute: 15,
+      dailyLimit: dbCache.config.dailyMessageLimit || 60,
+    }
+  );
+
+  visitor.rateRecord = updatedRecord;
+
+  if (!rateCheck.allowed) {
+    saveDatabase(dbCache);
+    return res.status(429).json({
+      success: false,
+      code: rateCheck.code,
+      message: rateCheck.message,
+      remainingToday: rateCheck.remainingToday,
+      waitSeconds: rateCheck.waitSeconds,
+    });
+  }
+
+  // Store user message
+  const userMsgId = `msg_${Date.now()}_u`;
+  const userChatMessage: ChatMessage = {
+    id: userMsgId,
+    role: 'user',
+    content: rawMessage,
+    timestamp: Date.now(),
+  };
+  visitor.messages.push(userChatMessage);
+
+  // Automatically extract potential memories from user message
+  try {
+    const candidates = extractMemoriesFromText(rawMessage);
+    const newMems = deduplicateMemories(candidates, visitor.memories);
+    for (const mem of newMems) {
+      visitor.memories.unshift({
+        id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        category: mem.category,
+        content: mem.content,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+  } catch (err) {
+    console.error('Error auto-extracting memories:', err);
+  }
+
+  saveDatabase(dbCache);
+
+  const apiKey = process.env.DEEPSEEK_API_KEY?.trim();
+
+  // If no API key configured, use built-in gentle preview mode
+  if (!apiKey || apiKey.length < 5) {
+    // Release in-flight lock
+    visitor.rateRecord = releaseVisitorInFlight(visitor.rateRecord);
+
+    const replyContent = generatePreviewReply(rawMessage, dbCache.config, visitor.memories);
+    const botMsgId = `msg_${Date.now()}_a`;
+    const botChatMessage: ChatMessage = {
+      id: botMsgId,
+      role: 'assistant',
+      content: replyContent,
+      timestamp: Date.now(),
+      isSimulated: true,
+    };
+    visitor.messages.push(botChatMessage);
+    saveDatabase(dbCache);
+
+    return res.json({
+      success: true,
+      message: botChatMessage,
+      remainingToday: rateCheck.remainingToday,
+      isSimulated: true,
+      notice: '当前服务端未配置 DEEPSEEK_API_KEY，已自动开启温情体验模式。配置密钥后将自动接入 DeepSeek 官方大模型。',
+    });
+  }
+
+  // DeepSeek Official API Call
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 35000); // 35s timeout
+
+  try {
+    const promptMessages = buildChatMessages(
+      dbCache.config,
+      visitor.memories,
+      visitor.messages.slice(0, -1),
+      rawMessage,
+      10
+    );
+
+    const modelName = process.env.DEEPSEEK_MODEL || dbCache.config.model || 'deepseek-flash';
+
+    const deepseekResponse = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: modelName,
+        messages: promptMessages,
+        temperature: 0.9,
+        max_tokens: 1024,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!deepseekResponse.ok) {
+      visitor.rateRecord = releaseVisitorInFlight(visitor.rateRecord);
+      saveDatabase(dbCache);
+
+      const status = deepseekResponse.status;
+      let errorText = '';
+      try {
+        const errJson = await deepseekResponse.json();
+        errorText = errJson?.error?.message || JSON.stringify(errJson);
+      } catch {
+        errorText = await deepseekResponse.text();
+      }
+
+      console.error(`DeepSeek API error [${status}]:`, errorText);
+
+      if (status === 401) {
+        return res.status(401).json({
+          success: false,
+          code: 'INVALID_API_KEY',
+          message: 'DeepSeek API 密钥无效或未通过验证，请检查服务端环境变量中的 DEEPSEEK_API_KEY。',
+        });
+      }
+
+      if (status === 402) {
+        return res.status(402).json({
+          success: false,
+          code: 'INSUFFICIENT_BALANCE',
+          message: 'DeepSeek 官方账户余额不足，请前往 platform.deepseek.com 查看余额与充值。',
+        });
+      }
+
+      if (status === 429) {
+        return res.status(429).json({
+          success: false,
+          code: 'UPSTREAM_RATE_LIMIT',
+          message: 'DeepSeek 官方接口请求达到上限，请稍候 30 秒再试哦。',
+        });
+      }
+
+      return res.status(status).json({
+        success: false,
+        code: 'UPSTREAM_ERROR',
+        message: `DeepSeek 接口异常 (${status})，请稍候重试。`,
+      });
+    }
+
+    const data = await deepseekResponse.json();
+    const assistantReply = data?.choices?.[0]?.message?.content?.trim();
+
+    if (!assistantReply) {
+      visitor.rateRecord = releaseVisitorInFlight(visitor.rateRecord);
+      saveDatabase(dbCache);
+      return res.status(502).json({
+        success: false,
+        code: 'EMPTY_REPLY',
+        message: '模型暂未生成有效回复，请重试一下吧~',
+      });
+    }
+
+    // Release in-flight
+    visitor.rateRecord = releaseVisitorInFlight(visitor.rateRecord);
+
+    const botMsgId = `msg_${Date.now()}_a`;
+    const botChatMessage: ChatMessage = {
+      id: botMsgId,
+      role: 'assistant',
+      content: assistantReply,
+      timestamp: Date.now(),
+      isSimulated: false,
+    };
+
+    visitor.messages.push(botChatMessage);
+    saveDatabase(dbCache);
+
+    return res.json({
+      success: true,
+      message: botChatMessage,
+      remainingToday: rateCheck.remainingToday,
+      isSimulated: false,
+    });
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    visitor.rateRecord = releaseVisitorInFlight(visitor.rateRecord);
+    saveDatabase(dbCache);
+
+    console.error('DeepSeek request exception:', error);
+
+    if (error.name === 'AbortError') {
+      return res.status(504).json({
+        success: false,
+        code: 'TIMEOUT',
+        message: '等待阿予组织语言超时啦，网络可能有点迟缓，请稍后再试一下吧~',
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      code: 'SERVER_ERROR',
+      message: '网络连接或服务出现了小插曲，请检查网络或稍后再试。',
+    });
+  }
+});
+
+// Setup Frontend serving
+async function startServer() {
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`「予你」AI 陪伴服务已就绪，正在监听端口 http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Server start failed:', err);
+  process.exit(1);
+});
