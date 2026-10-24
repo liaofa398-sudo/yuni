@@ -211,7 +211,7 @@ export const PetStage: React.FC<PetStageProps> = ({
           transform: `translate(${dragOffset.x}px, ${dragOffset.y}px)`,
           transition: isDragging ? 'none' : 'transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
         }}
-        className={`relative z-10 cursor-pointer touch-none flex flex-col items-center select-none ${
+        className={`fixed bottom-24 right-4 z-[999] cursor-pointer touch-none flex flex-col items-center select-none ${
           isPoking ? 'pet-poking' : isDragging ? '' : 'pet-floating'
         }`}
       >
@@ -219,7 +219,7 @@ export const PetStage: React.FC<PetStageProps> = ({
         <div className="absolute -bottom-4 w-44 h-8 bg-black/40 blur-md rounded-full pointer-events-none" />
 
         {/* The Uploaded Chibi Character PNG Asset */}
-        <div className="relative w-64 h-64 sm:w-72 sm:h-72 drop-shadow-[0_12px_24px_rgba(244,114,182,0.25)]">
+        <div className="relative w-32 h-32 sm:w-40 sm:h-40 drop-shadow-[0_12px_24px_rgba(244,114,182,0.25)]">
           <img
             src="/character.png"
             alt={companionName}

@@ -635,10 +635,12 @@ async function startServer() {
       server: { middlewareMode: true },
       appType: 'spa',
     });
+    app.use(express.static(path.join(process.cwd(), "public")));
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
+    app.use(express.static(path.join(process.cwd(), "public")));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
