@@ -18,16 +18,25 @@ const POKE_QUOTES = [
   '戳我干嘛……',
   '嗯？找我有事吗？',
   '又来啦？我一直在呢。',
-  '嘿嘿，抓住我的小尾巴啦~',
+  '嘿嘿，抓住我的小尾巴啦\~',
   '在呢在呢，随时准备听你说！',
 ];
 
 const ANNOYED_QUOTES = [
   '喂喂，别一直连续戳啦！',
-  '你很闲嘛？快去做正事啦~',
+  '你很闲嘛？快去做正事啦\~',
   '……真的很喜欢戳我呀？',
   '再戳我要装睡不理你啦！(气鼓鼓)',
 ];
+
+const PARTICLE_EMOJIS = ['✨', '💖', '⭐', '💕', '🌸', '✦'];
+
+interface Particle {
+  id: number;
+  emoji: string;
+  x: number;
+  y: number;
+}
 
 export const PetStage: React.FC<PetStageProps> = ({
   state,
@@ -41,8 +50,10 @@ export const PetStage: React.FC<PetStageProps> = ({
 }) => {
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const [isPoking, setIsPoking] = useState(false);
+  const [showHeart, setShowHeart] = useState(false);
+  const [particles, setParticles] = useState<Particle[]>([]);
   const [currentThought, setCurrentThought] = useState<string>(
-    bubbleText || '今天心情不错，随时来和我聊聊吧~'
+    bubbleText || '今天心情不错，随时来和我聊聊吧\~'
   );
 
   // Drag interaction state
@@ -50,12 +61,30 @@ export const PetStage: React.FC<PetStageProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
   const hasMovedRef = useRef(false);
+  const particleIdRef = useRef(0);
 
   useEffect(() => {
     if (bubbleText) {
       setCurrentThought(bubbleText);
     }
   }, [bubbleText]);
+
+  const spawnParticles = (count = 4) => {
+    const newOnes: Particle[] = [];
+    for (let i = 0; i < count; i++) {
+      particleIdRef.current += 1;
+      newOnes.push({
+        id: particleIdRef.current,
+        emoji: PARTICLE_EMOJIS[Math.floor(Math.random() * PARTICLE_EMOJIS.length)],
+        x: 20 + Math.random() * 60,
+        y: 20 + Math.random() * 40,
+      });
+    }
+    setParticles((prev) => [...prev, ...newOnes]);
+    setTimeout(() => {
+      setParticles((prev) => prev.filter((p) => !newOnes.find((n) => n.id === p.id)));
+    }, 1200);
+  };
 
   const handlePointerDown = (e: React.PointerEvent) => {
     setIsDragging(true);
@@ -68,7 +97,6 @@ export const PetStage: React.FC<PetStageProps> = ({
     if (!isDragging) return;
     const newX = e.clientX - dragStartRef.current.x;
     const newY = e.clientY - dragStartRef.current.y;
-    // Limit drag radius
     const dist = Math.sqrt(newX * newX + newY * newY);
     if (dist > 5) {
       hasMovedRef.current = true;
@@ -78,22 +106,23 @@ export const PetStage: React.FC<PetStageProps> = ({
     setDragOffset({ x: clampedX, y: clampedY });
   };
 
-  const handlePointerUp = (e: React.PointerEvent) => {
+  const handlePointerUp = () => {
     if (!isDragging) return;
     setIsDragging(false);
 
-    // If it was a click/tap (not a significant drag), trigger poke
     if (!hasMovedRef.current) {
       handleCharacterPoke();
     }
 
-    // Spring back to center
     setDragOffset({ x: 0, y: 0 });
   };
 
   const handleCharacterPoke = () => {
     setIsPoking(true);
-    setTimeout(() => setIsPoking(false), 450);
+    setShowHeart(true);
+    spawnParticles(5);
+    setTimeout(() => setIsPoking(false), 480);
+    setTimeout(() => setShowHeart(false), 700);
 
     onPoke();
 
@@ -119,6 +148,20 @@ export const PetStage: React.FC<PetStageProps> = ({
         () => setIsPlayingAudio(false)
       );
     }
+  };
+
+  // 根据状态选择角色动画 class
+  const getCharacterClass = () => {
+    const base = 'pet-character relative w-32 h-32 sm:w-40 sm:h-40 drop-shadow-[0_12px_24px_rgba(244,114,182,0.25)]';
+    if (isDragging) return `${base} pet-dragging`;
+    if (isPoking) return `${base} pet-poking`;
+    if (isThinking || state.activity === 'thinking') return `${base} pet-thinking`;
+    if (state.activity === 'happy') return `${base} pet-happy`;
+    if (state.activity === 'annoyed') return `${base} pet-annoyed`;
+    if (state.activity === 'sleepy' || state.energy < 30) return `${base} pet-sleepy`;
+    if (state.mood > 85 && state.affection > 70) return `${base} pet-happy`;
+    if (state.mood < 40) return `${base} pet-shy`;
+    return base;
   };
 
   return (
@@ -211,28 +254,38 @@ export const PetStage: React.FC<PetStageProps> = ({
           transform: `translate(${dragOffset.x}px, ${dragOffset.y}px)`,
           transition: isDragging ? 'none' : 'transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
         }}
-        className={`fixed bottom-24 right-4 z-[999] cursor-pointer touch-none flex flex-col items-center select-none ${
-          isPoking ? 'pet-poking' : isDragging ? '' : 'pet-floating'
-        }`}
+        className="fixed bottom-24 right-4 z-[999] cursor-pointer touch-none flex flex-col items-center select-none"
       >
         {/* Soft shadow below pet */}
         <div className="absolute -bottom-4 w-44 h-8 bg-black/40 blur-md rounded-full pointer-events-none" />
 
-        {/* The Uploaded Chibi Character PNG Asset */}
-        <div className="relative w-32 h-32 sm:w-40 sm:h-40 drop-shadow-[0_12px_24px_rgba(244,114,182,0.25)]">
+        {/* The Character PNG + animations */}
+        <div className={getCharacterClass()}>
           <img
             src="/character.png"
             alt={companionName}
             referrerPolicy="no-referrer"
-            className="w-full h-full object-contain pointer-events-none select-none transition-transform"
+            className="w-full h-full object-contain pointer-events-none select-none"
+            draggable={false}
           />
 
-          {/* Poke heart effect */}
-          {isPoking && (
-            <div className="absolute top-1/3 left-1/2 -translate-x-1/2 text-pink-400 pointer-events-none animate-bounce">
+          {/* 戳一戳爱心爆开 */}
+          {showHeart && (
+            <div className="pet-heart-burst text-pink-400">
               <Heart className="w-8 h-8 fill-pink-400" />
             </div>
           )}
+
+          {/* 粒子效果 */}
+          {particles.map((p) => (
+            <span
+              key={p.id}
+              className="pet-particle"
+              style={{ left: `\( {p.x}%`, top: ` \){p.y}%` }}
+            >
+              {p.emoji}
+            </span>
+          ))}
         </div>
       </div>
 
